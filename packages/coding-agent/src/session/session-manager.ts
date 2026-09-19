@@ -383,14 +383,17 @@ function isDraftOnlyMetadataEntry(entry: SessionEntry): boolean {
 	// `/plan` toggles that leave the session otherwise empty; entries carrying
 	// real conversation state — messages, compactions, branch summaries,
 	// custom/custom_message, session_init, labels, title/tool selection — never
-	// reach this branch and always keep the file resumable.
+	// reach this branch and always keep the file resumable. A vibe `mode_change`
+	// is excluded: it is a deliberate mode boundary whose persisted snapshot
+	// later resumes must re-arm from, so the session file must survive.
 	switch (entry.type) {
 		case "model_change":
 		case "thinking_level_change":
 		case "service_tier_change":
-		case "mode_change":
 		case "credential_pin":
 			return true;
+		case "mode_change":
+			return entry.mode !== "vibe";
 		default:
 			return false;
 	}
@@ -607,7 +610,7 @@ interface SessionManagerStateSnapshot {
 	hasTitleSlot: boolean;
 	onDisk: boolean;
 	needsRewrite: boolean;
-	draftOnlySessionCleanupArmed: boolean;
+	emptySessionCleanupArmed: boolean;
 	fallbackRuntimeOnly: boolean;
 	header: SessionHeader;
 	entries: SessionEntry[];
@@ -719,11 +722,18 @@ export class SessionManager {
 	/** Lazy gate crossed (ensureOnDisk / loaded file): every entry must persist from now on. */
 	#forceFileCreation = false;
 	/**
-	 * Armed only when this manager observed a draft sidecar lifecycle that
-	 * materialized an otherwise metadata-only session file. Explicit
-	 * ensureOnDisk() callers (ACP session/new, handoff) must survive close().
+	 * Arms the close-time empty-session drop ({@link #dropIfEmptyAndNoDraft}).
+	 * Armed by default for every fresh session this manager allocates
+	 * (`create()`, continue-with-no-session) and by the draft
+	 * sidecar lifecycle when it materializes a metadata-only file. Never armed
+	 * on open/resume/fork/copy/branch or explicit `newSession()` boundary
+	 * paths: those files are externally referenced (later processes,
+	 * advisor artifacts key off them) and must survive close() even when
+	 * their content is empty. The drop itself still fires only for
+	 * draft-only-empty files — any durable conversation entry or a draft
+	 * sidecar keeps the file.
 	 */
-	#draftOnlySessionCleanupArmed = false;
+	#emptySessionCleanupArmed = false;
 
 	/**
 	 * Collab replication tap: invoked for every appended entry with the
@@ -1316,7 +1326,7 @@ export class SessionManager {
 		// durable entry exists, later appends cannot satisfy its delete predicate.
 		if (
 			this.#storage.withSessionFileLockSync &&
-			this.#draftOnlySessionCleanupArmed &&
+			this.#emptySessionCleanupArmed &&
 			!isDraftOnlyMetadataEntry(entry) &&
 			this.#entries.every(candidate => candidate === entry || isDraftOnlyMetadataEntry(candidate))
 		) {
@@ -1500,7 +1510,8 @@ export class SessionManager {
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
 		this.#forceFileCreation = false;
-		this.#draftOnlySessionCleanupArmed = false;
+		// Externally referenced paths (open/resume/fork/copy and explicit /new) disarm explicitly.
+		this.#emptySessionCleanupArmed = true;
 		this.#turnBudgetTotal = null;
 		this.#turnBudgetHard = false;
 		this.#turnOutputBaseline = 0;
@@ -1673,7 +1684,7 @@ export class SessionManager {
 			expectedDiskSize: this.#expectedDiskSize,
 			onDisk: this.#fileIsCurrent,
 			needsRewrite: this.#rewriteRequired,
-			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
+			emptySessionCleanupArmed: this.#emptySessionCleanupArmed,
 			fallbackRuntimeOnly: this.#fallbackRuntimeOnly,
 			// Entries are snapshotted by reference (switch/reload replaces the
 			// array wholesale). The header is cloned: moveTo mutates it in place
@@ -1717,7 +1728,7 @@ export class SessionManager {
 		this.#fileIsCurrent = snapshot.onDisk;
 		this.#rewriteRequired = snapshot.needsRewrite;
 		this.#forceFileCreation = snapshot.onDisk;
-		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
+		this.#emptySessionCleanupArmed = snapshot.emptySessionCleanupArmed;
 		this.#fallbackRuntimeOnly = snapshot.fallbackRuntimeOnly;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
@@ -1782,7 +1793,7 @@ export class SessionManager {
 	): Promise<void> {
 		await this.#drainAndCloseWriter();
 		this.#clearDiskError();
-		this.#draftOnlySessionCleanupArmed = false;
+		this.#emptySessionCleanupArmed = false;
 
 		const resolvedSessionFile = path.resolve(sessionFile);
 		const loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
@@ -1811,6 +1822,8 @@ export class SessionManager {
 			// Explicit but empty/missing path (e.g. --session flag): start fresh but
 			// keep the requested path and materialize the header immediately.
 			this.#resetToNewSession(options?.newSession, resolvedSessionFile);
+			// Explicit path (--session/resume/ACP switch): externally referenced, never drop.
+			this.#emptySessionCleanupArmed = false;
 			this.#expectedDiskSize = sourceSize;
 			this.#forceFileCreation = true;
 			await this.#rewriteAtomically();
@@ -1869,6 +1882,9 @@ export class SessionManager {
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
 		await this.#drainAndCloseWriter();
 		const sessionFile = this.#resetToNewSession(options);
+		// An explicit /new is a durable boundary: later processes' continueRecent
+		// and advisor artifacts key off this exact file, so it must survive close.
+		this.#emptySessionCleanupArmed = false;
 		await this.ensureOnDisk();
 		return sessionFile;
 	}
@@ -1919,7 +1935,7 @@ export class SessionManager {
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
 		this.#forceFileCreation = true;
-		this.#draftOnlySessionCleanupArmed = false;
+		this.#emptySessionCleanupArmed = false;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
@@ -2095,6 +2111,8 @@ export class SessionManager {
 		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		manager.#resetToNewSession();
+		// Persisted copy = externally referenced history; never drop at close.
+		manager.#emptySessionCleanupArmed = false;
 		manager.#sessionName = this.#sessionName;
 		manager.#titleSource = this.#titleSource;
 		manager.#titleUpdatedAt = this.#titleUpdatedAt;
@@ -2231,22 +2249,29 @@ export class SessionManager {
 	}
 
 	/**
-	 * Drop only session files that this manager saw materialized for a draft and
-	 * that still contain no durable conversation or extension state. Explicit
-	 * ensureOnDisk() records (ACP session/new, handoff) stay resumable.
+	 * Close-time self-clean for fresh sessions: drop the session file when it
+	 * holds no durable conversation or extension state (only draft-only
+	 * metadata entries), has no draft sidecar, and nothing else references it.
+	 * Fires only while armed — fresh sessions arm at creation, the draft
+	 * lifecycle re-arms when it materializes a metadata-only file, and
+	 * open/resume/fork/copy/branch and explicit `newSession()` boundary paths
+	 * stay disarmed because their files are externally referenced history and
+	 * must never be dropped. The final
+	 * emptiness check re-reads the on-disk content under the storage lock so a
+	 * concurrent writer's real entries veto the deletion.
 	 */
 	async #dropIfEmptyAndNoDraft(): Promise<void> {
-		if (!this.#draftOnlySessionCleanupArmed) return;
+		if (!this.#emptySessionCleanupArmed) return;
 		const sessionFile = this.#sessionFile;
 		if (!sessionFile || !this.#storage.existsSync(sessionFile)) {
-			this.#draftOnlySessionCleanupArmed = false;
+			this.#emptySessionCleanupArmed = false;
 			return;
 		}
 		const draftPath = this.#draftPath();
 		if (draftPath && this.#storage.existsSync(draftPath)) return;
 		if (!this.#entries.every(isDraftOnlyMetadataEntry)) {
 			await this.#clearDraftOnlySessionMarker();
-			this.#draftOnlySessionCleanupArmed = false;
+			this.#emptySessionCleanupArmed = false;
 			return;
 		}
 		// Another process can consume the draft and append a real conversation
@@ -2265,13 +2290,13 @@ export class SessionManager {
 			});
 			if (!deleted) {
 				await this.#clearDraftOnlySessionMarker();
-				this.#draftOnlySessionCleanupArmed = false;
+				this.#emptySessionCleanupArmed = false;
 				return;
 			}
 			this.#fileIsCurrent = false;
 			this.#forceFileCreation = false;
 			this.#hasTitleSlot = false;
-			this.#draftOnlySessionCleanupArmed = false;
+			this.#emptySessionCleanupArmed = false;
 		} catch (err) {
 			if (!isEnoent(err)) {
 				logger.warn("Failed to drop empty session on close", { sessionFile, error: String(err) });
@@ -2577,7 +2602,7 @@ export class SessionManager {
 		await this.ensureOnDisk();
 		if (draftWillMaterializeMetadataOnlyFile) {
 			await this.#writeDraftOnlySessionMarker();
-			this.#draftOnlySessionCleanupArmed = true;
+			this.#emptySessionCleanupArmed = true;
 		}
 		await this.#storage.writeText(draftPath, text);
 	}
@@ -2600,7 +2625,7 @@ export class SessionManager {
 			if (!isEnoent(err)) throw err;
 		}
 		if (this.#entries.every(isDraftOnlyMetadataEntry) && this.#hasDraftOnlySessionMarker())
-			this.#draftOnlySessionCleanupArmed = true;
+			this.#emptySessionCleanupArmed = true;
 
 		return draft;
 	}
@@ -3235,6 +3260,8 @@ export class SessionManager {
 		}
 
 		this.#sessionFile = newSessionFile;
+		// A branch is a deliberate user-created snapshot; never drop at close.
+		this.#emptySessionCleanupArmed = false;
 		this.#expectedDiskSize = null;
 		this.#rewriteSynchronously();
 		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
@@ -3334,6 +3361,8 @@ export class SessionManager {
 			},
 			options?.sessionFile,
 		);
+		// A fork copies externally referenced history (options.sessionFile may pin the path); never drop.
+		manager.#emptySessionCleanupArmed = false;
 		manager.#header.title = sourceHeader?.title;
 		manager.#header.titleSource = sourceHeader?.titleSource;
 		manager.#additionalDirectories = (sourceHeader?.additionalDirectories ?? []).filter(d => d !== path.resolve(cwd));

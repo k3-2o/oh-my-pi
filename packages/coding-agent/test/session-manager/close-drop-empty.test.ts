@@ -224,8 +224,12 @@ describe("SessionManager close() drops empty metadata-only sessions", () => {
 		expect(await fileExists(sessionFile)).toBe(true);
 	});
 
-	it("keeps an explicitly ensured empty session discoverable after close", async () => {
-		using tempDir = TempDir.createSync("@pi-session-close-keep-explicit-empty-");
+	// Fresh sessions arm the empty-session cleanup at creation, so a file that
+	// was materialized (ensureOnDisk / ACP session/new discoverability) but
+	// never gained a durable entry, a draft, or any extension state must not
+	// survive close: it would otherwise pollute the resume picker forever.
+	it("drops a freshly created session that was materialized but never used", async () => {
+		using tempDir = TempDir.createSync("@pi-session-close-drop-explicit-empty-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
 		await session.ensureOnDisk();
 
@@ -234,9 +238,46 @@ describe("SessionManager close() drops empty metadata-only sessions", () => {
 
 		await session.close();
 
+		expect(await fileExists(sessionFile)).toBe(false);
+	});
+
+	// An explicit /new is a durable boundary, not an unused fresh session:
+	// newSession() materializes the file deliberately (later processes'
+	// continueRecent and advisor artifacts key off it), so the file must
+	// survive close. The implicit startup session is what self-cleans.
+	it("keeps a newSession() boundary file when it stays unused", async () => {
+		using tempDir = TempDir.createSync("@pi-session-close-keep-new-session-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionFile = await session.newSession();
+		if (!sessionFile) throw new Error("Expected persistent session file");
+		expect(await fileExists(sessionFile)).toBe(true);
+
+		await session.close();
+
 		expect(await fileExists(sessionFile)).toBe(true);
 	});
 
+	// Draft-only metadata entries (mode/model changes) are startup selector
+	// state, not durable conversation. They must not shield a fresh session's
+	// file from the teardown drop — even when no draft lifecycle ever ran.
+	it("drops a session whose only entries are draft-only metadata", async () => {
+		using tempDir = TempDir.createSync("@pi-session-close-drop-metadata-only-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		session.appendModelChange("hai-proxy/anthropic--claude-4.6-opus");
+		session.appendModeChange("plan", { planFilePath: "local://PLAN.md" });
+		await session.ensureOnDisk();
+
+		const sessionFile = session.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persistent session file");
+
+		await session.close();
+
+		expect(await fileExists(sessionFile)).toBe(false);
+	});
+
+	// Resumed sessions are externally referenced history: setSessionFile() keeps
+	// the cleanup flag disarmed, so an empty resumed file (draft consumed, no
+	// marker ever written) must survive close.
 	it("keeps an explicitly ensured empty session after its draft is consumed on resume", async () => {
 		using tempDir = TempDir.createSync("@pi-session-close-keep-explicit-resumed-draft-");
 		const firstRun = SessionManager.create(tempDir.path(), tempDir.path());
@@ -285,5 +326,44 @@ describe("SessionManager close() drops empty metadata-only sessions", () => {
 		await session.close();
 
 		expect(await fileExists(sessionFile)).toBe(false);
+	});
+
+	// Branching mints a deliberate user-created snapshot of a chosen path:
+	// its file must never inherit the fresh-session cleanup, even when the
+	// branch carries only selector metadata.
+	it("keeps a branched session whose copied path is metadata-only", async () => {
+		using tempDir = TempDir.createSync("@pi-session-close-keep-branch-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		const leafId = session.appendModelChange("hai-proxy/anthropic--claude-4.6-opus");
+		await session.ensureOnDisk();
+		const oldSessionFile = session.getSessionFile();
+		if (!oldSessionFile) throw new Error("Expected persistent session file");
+
+		const branchFile = session.createBranchedSession(leafId);
+		if (!branchFile) throw new Error("Expected persistent branch file");
+		expect(branchFile).not.toBe(oldSessionFile);
+
+		await session.close();
+
+		expect(await fileExists(branchFile)).toBe(true);
+		expect(await fileExists(oldSessionFile)).toBe(true);
+	});
+
+	// A fork copies history into a new externally-referenced file: the
+	// cleanup must stay disarmed even when the copy holds only draft-only
+	// metadata.
+	it("keeps a forked session whose file holds only draft-only metadata", async () => {
+		using tempDir = TempDir.createSync("@pi-session-close-keep-fork-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		session.appendModelChange("hai-proxy/anthropic--claude-4.6-opus");
+		await session.ensureOnDisk();
+
+		const forked = await session.fork();
+		if (!forked) throw new Error("Expected persistent fork");
+		session.appendModeChange("plan", { planFilePath: "local://PLAN.md" });
+
+		await session.close();
+
+		expect(await fileExists(forked.newSessionFile)).toBe(true);
 	});
 });

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed unused fresh sessions leaving empty .jsonl files that cluttered the resume picker; such files are now dropped at teardown.
+
 ## [18.2.6] - 2026-09-18
 
 ### Fixed
